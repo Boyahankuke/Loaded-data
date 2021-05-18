@@ -1,0 +1,443 @@
+---
+title: "VDJdb summary statistics"
+output:
+  html_document:
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Make sure to keep the default for normal processing.
+default_output_hook <- knitr::knit_hooks$get("output")
+
+# Output hooks handle normal R console output.
+knitr::knit_hooks$set( output = function(x, options) {
+
+  comment <- knitr::opts_current$get("comment")
+  if( is.na(comment) ) comment <- ""
+  can_null <- grepl( paste0( comment, "\\s*\\[\\d?\\]" ),
+                     x, perl = TRUE)
+  do_null <- isTRUE( knitr::opts_current$get("null_prefix") )
+  if( can_null && do_null ) {
+    # By default R print output aligns at the right brace.
+    align_index <- regexpr( "\\]", x )[1] - 1
+    # Two cases: start or newline
+    re <- paste0( "^.{", align_index, "}\\]")
+    rep <- comment
+    x <- gsub( re, rep,  x )
+    re <- paste0( "\\\n.{", align_index, "}\\]")
+    rep <- paste0( "\n", comment )
+    x <- gsub( re, rep,  x )
+  }
+
+  default_output_hook( x, options )
+
+})
+
+knitr::opts_template$set("kill_prefix"=list(comment=NA, null_prefix=TRUE))
+```
+
+```{r message=FALSE, warning=FALSE}
+library(knitr)
+library(ggplot2)
+library(ggpubr)
+library(RColorBrewer)
+library(data.table)
+library(forcats)
+#devtools::install_github("teunbrand/ggh4x")
+library(ggh4x)
+library(ggalluvial)
+library(ggrepel)
+library(tidyverse)
+library(dplyr)
+library(httr)
+library(xml2)
+library(stringr)
+library(gridExtra)
+select = dplyr::select
+
+df = fread("../database/vdjdb.slim.txt", header=T, sep="\t")
+```
+
+!summary_embed_start!
+
+```{r, null_prefix=TRUE, warning=FALSE}
+paste("Last updated on", format(Sys.time(), '%d %B, %Y'))
+```
+
+#### Record statistics by species and TCR chain
+
+General statistics. Note that general statistics is computed using the 'slim' database version. This version, for example, lists the same TCR sequence found in several samples/studies only once.
+
+```{r warning=FALSE, message=FALSE}
+df.sg = df %>% 
+  group_by(species, gene) %>%
+  summarize(records = length(complex.id), 
+            paired.records = sum(ifelse(complex.id=="0",0,1)),
+            epitopes = length(unique(antigen.epitope)),
+            publications = length(unique(str_split_fixed(reference.id, ",", n = Inf)[,1]))) %>%
+  arrange(species, gene)
+
+colnames(df.sg) = c("Species", "Chain", "Records", "Paired records", "Unique epitopes", "Publications")
+
+kable(format = "html", df.sg)
+```
+
+#### Record statistics by year
+
+```{r message=FALSE, warning=FALSE, echo=FALSE, cache=FALSE}
+# Load data 
+
+dt.vdjdb = fread("../database/vdjdb_full.txt", sep = "\t", fill=T)
+
+dt.vdjdb.s = dt.vdjdb %>%
+  filter(species != "MacacaMulatta") %>%
+  mutate(tcr_key = paste(v.alpha, j.alpha, cdr3.alpha, v.beta, j.beta, cdr3.beta),
+         mhc_key = paste(mhc.a, mhc.b),
+         chains = ifelse(cdr3.alpha != "", ifelse(cdr3.beta != "", "paired", "TRA"), "TRB")) %>%
+  select(reference.id, tcr_key, mhc_key, chains, antigen.epitope, species) %>%
+  unique
+
+# Fetch pubmed info
+
+ids = unique((dt.vdjdb.s %>%
+  filter(substr(reference.id,1,4)=="PMID") %>%
+  mutate(id = str_split_fixed(reference.id, ":", 2)[,2]))$id)
+
+pm_data = content(GET("https://eutils.ncbi.nlm.nih.gov/", 
+                      path = "entrez/eutils/esummary.fcgi",
+                      query = list(db = "pubmed", 
+                                   id = paste0(ids,collapse = ","))))
+
+invisible(write_xml(pm_data, "dates.xml"))
+pm_data_2 = readLines("dates.xml")
+tmp=file.remove("dates.xml")
+
+pm_data_id = str_split_fixed(pm_data_2[grepl("<Id>", pm_data_2)], "[<>]", n = Inf)[,3]
+pm_data_date = str_split_fixed(pm_data_2[grepl('Name="PubDate"', pm_data_2)], "[<>]", n = Inf)[,3]
+
+dt.pubdate = data.table(
+  reference.id = paste0("PMID:", pm_data_id),
+  pub_date = str_split_fixed(pm_data_date, " ", n = Inf)[,1]
+)
+
+dt.pubdate = rbind(dt.pubdate,
+                   data.frame(reference.id = 
+                                c("https://www.10xgenomics.com/resources/application-notes/a-new-way-of-exploring-immunity-linking-highly-multiplexed-antigen-recognition-to-immune-repertoire-and-phenotype/#",
+                                  "http://mediatum.ub.tum.de/doc/1136748",
+                                  "https://github.com/antigenomics/vdjdb-db/issues/288",
+                                  "https://github.com/antigenomics/vdjdb-db/issues/193",
+                                  "https://github.com/antigenomics/vdjdb-db/issues/252",
+                                  "https://github.com/antigenomics/vdjdb-db/issues/313",
+                                  "https://github.com/antigenomics/vdjdb-db/issues/312",
+                                  "https://github.com/antigenomics/vdjdb-db/issues/311",
+                                  "https://github.com/antigenomics/vdjdb-db/issues/315"),
+                              pub_date = c(2019, 
+                                           2014, 
+                                           2019, 
+                                           2017, 
+                                           2017, 
+                                           2020,
+                                           2020,
+                                           2020,
+                                           2020) %>% as.character, stringsAsFactors = F))
+```
+
+Number of unique TCR sequences, epitopes, MHC alleles and publications by **publication** year, cumulative plots.
+
+```{r message=FALSE,warning=FALSE}
+dt.vdjdb.s2 = dt.vdjdb.s %>%
+  merge(dt.pubdate %>% mutate(pub_date = pub_date %>% as.integer), 
+        by = "reference.id",
+        allow.cartesian = T) %>%
+  merge(expand.grid(pub_date = unique(dt.pubdate$pub_date) %>% as.integer,
+                    pub_date2 = unique(dt.pubdate$pub_date) %>% as.integer), 
+        by = "pub_date",
+        allow.cartesian = T) %>%
+  group_by(pub_date2, chains) %>%
+  summarise(tcr_count = length(unique(tcr_key[which(pub_date <= pub_date2)])),
+            epi_count = length(unique(antigen.epitope[which(pub_date <= pub_date2)])),
+            ref_count = length(unique(reference.id[which(pub_date <= pub_date2)])),
+            mhc_count = length(unique(mhc_key[which(pub_date <= pub_date2)])))
+
+p1=ggplot(dt.vdjdb.s2, aes(x = as.integer(pub_date2), y = tcr_count, color = chains)) +
+  geom_line() +
+  geom_point() +
+  ylab("") +
+  scale_x_continuous("", breaks = seq(1995, 2021, by =2)) +
+  scale_color_brewer(palette = "Set1") +
+  theme_pubclean() + ggtitle("Number of unique TCR sequences") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+p2=ggplot(dt.vdjdb.s2, aes(x = as.integer(pub_date2), y = epi_count, color = chains)) +
+  geom_line() +
+  geom_point() +
+  ylab("") +
+  scale_x_continuous("", breaks = seq(1995, 2021, by =2)) +
+  scale_color_brewer(palette = "Set1") +
+  theme_pubclean() + ggtitle("Number of unique epitopes") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+p3=ggplot(dt.vdjdb.s2, aes(x = as.integer(pub_date2), y = ref_count, color = chains)) +
+  geom_line() +
+  geom_point() +
+  ylab("") +
+  scale_x_continuous("", breaks = seq(1995, 2021, by =2)) +
+  scale_color_brewer(palette = "Set1") +
+  theme_pubclean() + ggtitle("Number of publications") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+
+p4=ggplot(dt.vdjdb.s2, aes(x = as.integer(pub_date2), y = mhc_count, color = chains)) +
+  geom_line() +
+  geom_point() +
+  ylab("") +
+  scale_x_continuous("", breaks = seq(1995, 2021, by =2)) +
+  scale_color_brewer("TCR chain(s)", palette = "Set1") +
+  theme_pubclean() + ggtitle("Number of MHC alleles") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5)) +
+  theme(legend.position="bottom")
+
+g_legend = function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)
+  }
+
+mylegend = g_legend(p4)
+
+grid.arrange(arrangeGrob(p1 + theme(legend.position="none"),
+                         p2 + theme(legend.position="none"),
+                         p3 + theme(legend.position="none"),
+                         p4 + theme(legend.position="none"),
+                         nrow=2),
+             mylegend, nrow=2,heights=c(10, 1)) #-> PX1
+
+#PX1 %>% plot
+#pdf("pubyear.pdf")
+#PX1 %>% plot
+#dev.off()
+
+#fwrite(dt.vdjdb.s2, "vdjdb_stats_pubyear.txt", sep = "\t")
+```
+
+#### Summary by antigen and antigen origin
+
+Representative data for Homo Sapiens
+
+```{r message=FALSE, warning=FALSE}
+df.a = df %>% 
+  filter(species == "HomoSapiens") %>%
+  group_by(antigen.species) %>% #, antigen.gene) %>%
+  summarize(records = n(), 
+            epitopes = length(unique(antigen.epitope)),
+            publications = length(unique(str_split_fixed(reference.id, ",", n = Inf)[,1]))) %>%
+  arrange(-records)
+
+colnames(df.a) = c("Parent species", #"Parent gene",
+                   "Records", "Unique epitopes", "Publications")
+kable(format = "html", df.a)
+```
+
+#### **COVID-19** data
+
+Summary of antigens and T-cell receptors related to COVID-19 pandemic.
+
+```{r message=FALSE, warning=FALSE}
+df %>% 
+  filter(species == "HomoSapiens", 
+         startsWith(as.character(antigen.species), "SARS-CoV")) %>%
+  group_by(antigen.species, antigen.gene, mhc.a, antigen.epitope, gene) %>%
+  summarize(records = n()) -> df.c
+
+colnames(df.c) = c("Strain", "Gene", "HLA", "Epitope", "TCR chain",
+                   "Records")
+
+ggplot(df.c %>% ungroup %>% arrange(Records),
+       aes(axis1 = Strain,
+           axis2 = Gene,
+           axis3 = gsub("HLA-", "", HLA),
+           axis4 = substr(Epitope,1,3),
+           axis5 = `TCR chain`,
+           y = log2(Records))) +
+  geom_alluvium(aes(fill = Epitope), 
+                color = "grey50") +
+  geom_stratum(fill = "grey50", color = "grey30") +
+  geom_label(stat = "stratum", label.strata = T,
+             label.size = 0, fill = "grey30", 
+             color = "white") +
+  theme_pubclean() +
+  scale_fill_brewer(guide = F, palette = "Spectral") +
+  ylab("") +
+  scale_x_discrete(limits = c("Strain", "Gene", "HLA", "Epitope", "TCR chain"),
+                   expand = c(.1, .1)) +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid.major.y = element_blank())
+
+kable(format = "html", df.c)
+```
+
+#### Summary by MHC alleles
+
+Representative data for Homo Sapiens
+
+```{r message=FALSE, warning=FALSE}
+df.m = df %>% 
+  as.tibble %>%
+  filter(species == "HomoSapiens") %>%
+  mutate(id = 1:n()) %>%
+  separate_rows(mhc.a, sep = ",") %>%
+  separate_rows(mhc.b, sep = ",") %>%
+  mutate(mhc.a.split = str_split_fixed(mhc.a, fixed(":"), n = Inf)[,1],
+         mhc.b.split = str_split_fixed(mhc.b, fixed(":"), n = Inf)[,1]) %>%
+  group_by(mhc.a.split, mhc.b.split) %>%
+  summarize(records = length(unique(id)), 
+            antigens = length(unique(antigen.epitope)),
+            publications = length(unique(str_split_fixed(reference.id, ",", n = Inf)[,1]))) %>%
+  arrange(-records)
+  
+colnames(df.m) = c("First chain", "Second chain", "Records", "Unique epitopes", "Publications")
+kable(format = "html", df.m)
+```
+
+#### Distribution VDJdb confidence scores
+
+Legend: 0 - low confidence, 1 - medium confidence, 2 - high confidence, 3 - very high confidence.
+
+```{r message=FALSE, warning=FALSE}
+df.score <- df %>%
+  group_by(mhc.class, gene, vdjdb.score) %>%
+  summarize(total = n())
+
+ggplot(df.score, aes(x=paste(mhc.class, gene, sep = " "), y=total, fill = as.factor(vdjdb.score))) + 
+  geom_bar(stat = "identity", position = "dodge", color = "black", size = 0.3) +  
+  xlab("") + scale_y_log10("Records") +
+  scale_fill_brewer("VDJdb score", palette = "PuBuGn") + 
+  theme_pubclean() +
+  theme(legend.position="bottom")
+```
+
+#### Spectratype
+
+Representative data for Homo Sapiens. The spectratype is colored by epitope.
+
+```{r message=FALSE, warning=FALSE}
+df.spe = subset(df, species=="HomoSapiens")
+
+ggplot(df.spe, 
+       aes(x=nchar(as.character(cdr3)), fill = antigen.epitope)) + 
+  geom_histogram(bins = 21, size = 0.3) + 
+  scale_x_continuous(limits = c(5,25), breaks = seq(5,25,5)) + 
+  facet_wrap(~gene) + 
+  scale_fill_hue(guide=F) +
+  xlab("CDR3 length") + ylab("Records") +
+  theme_pubclean()
+```
+
+#### V(D)J usage and MHC alleles
+
+Representative data for Homo Sapiens, Variable gene. Only Variable genes and MHC alleles with at least 10 records are shown.
+
+```{r message=FALSE, warning=FALSE, fig.height=10, fig.width=6}
+df.vhla = df %>% 
+  as.tibble %>%
+  filter(species == "HomoSapiens" ) %>%
+  mutate(id = 1:n()) %>%
+  separate_rows(mhc.a, sep = ",") %>%
+  separate_rows(mhc.b, sep = ",") %>%
+  separate_rows(v.segm, sep = ",") %>%
+  mutate(mhc.a.split = str_split_fixed(mhc.a, fixed(":"), n = Inf)[,1],
+         mhc.b.split = str_split_fixed(mhc.b, fixed(":"), n = Inf)[,1],
+         v.segm.split = str_split_fixed(v.segm, fixed("*"), n = Inf)[,1]) %>%
+  group_by(gene, mhc.class, mhc.a.split, mhc.b.split, v.segm.split) %>%
+  summarize(records = length(unique(id))) %>%
+  group_by(mhc.class, mhc.a.split, mhc.b.split) %>%
+  mutate(records.mhc = sum(records)) %>%
+  group_by(gene, v.segm.split) %>%
+  mutate(records.v = sum(records)) %>%
+  filter(records.mhc >= 10, records.v >= 10)
+  
+#df.vhla$v.segm.split = with(df.vhla, factor(v.segm.split, v.segm.split[order(records.v)]))
+#df.vhla$mhc.a.split = with(df.vhla, factor(mhc.a.split, mhc.a.split[order(records.mhc)]))
+
+ggplot(df.vhla, aes(x=gsub("HLA-", "", paste(mhc.a.split, mhc.b.split, sep = " / ")) %>%
+                      fct_reorder(records), 
+                    y=v.segm.split %>%
+                      fct_reorder(records), fill = pmin(records, 1000))) +
+  geom_tile() +
+  scale_fill_gradientn("Records", colors=colorRampPalette(brewer.pal(9, 'PuBuGn'))(32), 
+                       trans="log", breaks = c(1, 10, 100, 1000)) +
+  xlab("") + ylab("") +
+  facet_grid(gene~mhc.class, scales="free", space="free") +
+  theme_pubclean() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1), 
+        axis.text.y = element_text(size = 8),
+        panel.grid.major = element_blank(),
+        legend.position = "right")
+```
+
+!summary_embed_end!
+
+#### Unique CDR3 sequences per epitope
+
+Representative data for Homo Sapiens
+
+```{r warning=FALSE}
+df.ag = df %>%
+  filter(species == "HomoSapiens") %>%
+  group_by(gene, mhc.class, antigen.species, antigen.gene, antigen.epitope) %>%
+  summarize(cdr3.count = length(unique(cdr3))) %>%
+  arrange(-cdr3.count)
+
+ggplot(df.ag, aes(x = cdr3.count)) +
+  geom_histogram() +
+  scale_x_log10("Unique CDR3s") + ylab("Number of epitopes") +
+  facet_wrap(~gene) +
+  theme_bw()
+
+colnames(df.ag) = c("TCR chain", "MHC class", "Parent species", "Parent gene", "Epitope sequence", "Unique CDR3")
+kable(format = "html", df.ag)
+```
+
+Epitopes, parent genes and species
+
+```{r}
+df %>%
+  filter(species == "HomoSapiens") %>%
+  select(antigen.species, antigen.gene, antigen.epitope) %>%
+  unique %>%
+  group_by(antigen.epitope) %>%
+  mutate(ambiguous.naming = ifelse(n() > 1, "*", "")) %>%
+  arrange(antigen.species, antigen.gene, antigen.epitope) %>%
+  kable(format = "html")
+```
+
+Some things for paper release
+
+```{r}
+dt.pubdate %>%
+  .$reference.id %>%
+  unique %>%
+  length
+
+df.sg %>%
+  .$Records %>%
+  sum
+
+df %>%
+  .$antigen.epitope %>%
+  unique %>% 
+  length
+
+dt.vdjdb.s2 %>%
+  ungroup %>%
+  mutate(pub_date2 = as.integer(pub_date2)) %>%
+  filter(pub_date2 == max(pub_date2)) %>%
+  .$tcr_count %>%
+  sum
+```
+
+```{r}
+#
+```
